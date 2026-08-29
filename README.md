@@ -41,19 +41,39 @@ uv pip install --python .venv\Scripts\python.exe --force-reinstall --no-deps tor
 ## Запуск
 
 ```bat
-:: английский → немецкий (Qwen)
+:: английский → немецкий (Qwen 0.6B — быстро)
 .venv\Scripts\python.exe universal_dub.py video.mp4 --source-lang en --target-lang de
+
+:: английский → немецкий, качество выше (Qwen 1.7B, ~x2 медленнее)
+.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang de --qwen-size 1.7b
+
+:: VOICE CLONE — клонировать голоса актёров оригинала (лучший вариант!)
+.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang de --voice-clone --qwen-size 1.7b
 
 :: английский → русский
 .venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang ru
 
 :: украинский (Edge-TTS fallback, Qwen не говорит по-украински)
 .venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang uk
-
-:: свой голос / отключить диаризацию
-.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang de --male-voice Dylan --female-voice Serena
-.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang ru --no-diarization
 ```
+
+## Voice Clone (Qwen3-TTS Base)
+
+`--voice-clone` клонирует голоса из оригинала видео:
+1. Диаризация разводит реплики по спикерам
+2. Для каждого спикера выбирается лучший фрагмент (2–12 с, содержательный текст)
+3. Qwen3-TTS-Base клонирует голос по этому фрагменту и озвучивает весь перевод
+
+Результат: дубляж звучит голосами актёров оригинала (на немецком/русском/...).
+Нужны: Base-модель (`models/Qwen3-TTS-1.7B-Base`, ~3.5 GB) + минимум ~3 с речи каждого спикера.
+
+## Модели
+
+| Модель | Размер | Назначение | Статус |
+|--------|--------|------------|--------|
+| Qwen3-TTS-12Hz-0.6B-CustomVoice | ~1.3 GB | быстрое озвучивание (9 спикеров) | ✅ скачана |
+| Qwen3-TTS-12Hz-1.7B-CustomVoice | ~3.5 GB | качество выше | ✅ скачана |
+| Qwen3-TTS-12Hz-1.7B-Base | ~3.5 GB | voice clone | ✅ скачана |
 
 Флаг `--source-lang` опционален (автоопределение Whisper), но рекомендуется для
 качества перевода (Hy-MT получает явный язык в промпте).
@@ -112,8 +132,8 @@ universal_dub/
 
 ## Дорожная карта
 
-- [ ] Voice clone (Qwen3-TTS-12Hz-Base) — клонировать голоса актёров оригинала
-- [ ] 1.7B модель (качество выше)
+- [x] Voice clone (Qwen3-TTS-12Hz-Base) — клонировать голоса актёров оригинала
+- [x] 1.7B модель (качество выше) — `--qwen-size 1.7b`
 - [ ] CUDA-сборка llama-cpp (перевод x5 быстрее)
 - [ ] Batch-перевод (один промпт на 5–10 сегментов)
 - [ ] A/B выбор голоса (auto-select по native language)

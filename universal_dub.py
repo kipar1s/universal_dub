@@ -126,38 +126,89 @@ def voices_for(target_lang: str, male_override=None, female_override=None):
 
 # ─── TTS Engines ─────────────────────────────────────────────────
 
-DEFAULT_QWEN_MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+# Qwen3-TTS model registry: size -> (CustomVoice dir, Base/voice-clone dir)
+QWEN_MODELS = {
+    "0.6b": {
+        "custom": ("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Qwen3-TTS-0.6B-CustomVoice"),
+        "base":   ("Qwen/Qwen3-TTS-12Hz-0.6B-Base", "Qwen3-TTS-0.6B-Base"),
+    },
+    "1.7b": {
+        "custom": ("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "Qwen3-TTS-1.7B-CustomVoice"),
+        "base":   ("Qwen/Qwen3-TTS-12Hz-1.7B-Base", "Qwen3-TTS-1.7B-Base"),
+    },
+}
+
+MIN_REF_SECONDS = 2.0     # min reference clip for voice clone
+MAX_REF_SECONDS = 12.0    # max reference clip
+
+
+def resolve_qwen_model(size="0.6b", kind="custom", explicit=None):
+    """Return local dir if downloaded, else HF id for on-demand download."""
+    if explicit:
+        return explicit
+    hf_id, local_name = QWEN_MODELS[size][kind]
+    local_dir = Path(__file__).parent / "models" / local_name
+    return str(local_dir) if local_dir.is_dir() else hf_id
 
 
 class QwenTTS:
-    """Qwen3-TTS (local, GPU). 10 languages, 9 premium speakers."""
+    """Qwen3-TTS (local, GPU). 10 languages, 9 premium speakers.
 
-    def __init__(self, model_id=None, local_dir=None, device="cuda"):
+    size:  '0.6b' | '1.7b'
+    clone: False -> generate_custom_voice (named speakers)
+          True  -> generate_voice_clone (ref_audio per speaker, Base model)
+    """
+
+    def __init__(self, size="0.6b", kind=None, model_path=None, device="cuda"):
         import torch
         from qwen_tts import Qwen3TTSModel
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        # prefer local download next to this project, then explicit id
-        local_candidate = Path(__file__).parent / "models" / "Qwen3-TTS-0.6B-CustomVoice"
-        model_path = local_dir or (
-            str(local_candidate) if local_candidate.is_dir()
-            else (model_id or DEFAULT_QWEN_MODEL)
-        )
-        log(f"[QwenTTS] Loading {model_path} on {self.device} ...")
+        kind = kind or ("base" if model_path and "Base" in Path(model_path).name else "custom")
+        model_path = model_path or resolve_qwen_model(size, kind)
+        log(f"[QwenTTS] Loading {model_path} on {self.device} (size={size}, kind={kind}) ...")
         self.model = Qwen3TTSModel.from_pretrained(
             model_path,
             device_map=self.device,
             dtype=torch.bfloat16,
         )
-        log(f"[QwenTTS] Ready. Languages: {self.model.get_supported_languages()}")
-        log(f"[QwenTTS] Speakers: {self.model.get_supported_speakers()}")
+        self.clone = kind == "base"
+        if self.clone:
+            log("[QwenTTS] Voice-clone mode (Base model)")
+        else:
+            log(f"[QwenTTS] Ready. Languages: {self.model.get_supported_languages()}")
+            try:
+                log(f"[QwenTTS] Speakers: {self.model.get_supported_speakers()}")
+            except Exception:
+                pass
+
+    def set_references(self, speaker_ref):
+        """speaker_ref: {speaker_label: (audio_path, ref_text)} for clone mode."""
+        self.speaker_ref = speaker_ref
+        log(f"[QwenTTS] Voice refs set for: {list(speaker_ref)}")
 
     def generate_sync(self, text, output_path, language=None, voice=None):
         import soundfile as sf
-        wavs, sr = self.model.generate_custom_voice(
-            text=text,
-            language=language or "Auto",
-            speaker=voice,
-        )
+        if self.clone:
+            ref = self.speaker_ref.get(voice) or (self.speaker_ref or {}).get(voice, None)
+            if ref is None and self.speaker_ref:
+                ref = next(iter(self.speaker_ref.values()))
+            if ref is None:
+                raise RuntimeError("voice-clone mode: no reference audio set "
+                                   "(set via QwenTTS.set_references)")
+            ref_audio, ref_text = ref
+            wavs, sr = self.model.generate_voice_clone(
+                text=text,
+                language=language or "Auto",
+                ref_audio=str(ref_audio),
+                ref_text=ref_text,
+                non_streaming_mode=True,
+            )
+        else:
+            wavs, sr = self.model.generate_custom_voice(
+                text=text,
+                language=language or "Auto",
+                speaker=voice,
+            )
         sf.write(str(output_path), np.asarray(wavs[0], dtype=np.float32), sr)
 
 
@@ -481,9 +532,84 @@ def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang, config=No
 
 # ─── Stage 4: TTS generation ─────────────────────────────────────
 
-def create_tts_engine(engine_name, model_id, local_dir, edge_voice):
+def select_voice_references(segments, audio_wav, artifacts_dir):
+    """Pick the best reference clip per speaker for voice cloning.
+
+    Strategy: per speaker, choose the longest voiced segment with
+    2s <= duration <= 12s (fallback: longest >= 2s, trimmed to 12s).
+    Clips are cut from the ORIGINAL audio with ffmpeg.
+
+    Returns {speaker_label: (clip_path, ref_text)} or {} if no usable refs.
+    """
+    from collections import defaultdict
+    by_spk = defaultdict(list)
+    for s in segments:
+        if s.original_text.strip():
+            by_spk[s.speaker].append(s)
+
+    refs = {}
+    clip_dir = Path(artifacts_dir) / "voice_refs"
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _FFMPEG_EXE if os.path.isfile(_FFMPEG_EXE) else "ffmpeg"
+
+    def _usable(s, min_alpha):
+        d = (s.end_ms - s.start_ms) / 1000.0
+        alpha = sum(1 for c in s.original_text if c.isalpha())
+        return d, alpha
+
+    for spk, segs in by_spk.items():
+        segs.sort(key=lambda s: s.end_ms - s.start_ms, reverse=True)
+        # prefer: 2-12s duration AND substantive text (>= 12 alpha chars);
+        # else any 2-12s clip; else longest >= 2s
+        chosen = None
+        for s in segs:
+            d, a = _usable(s, 12)
+            if MIN_REF_SECONDS <= d <= MAX_REF_SECONDS and a >= 12:
+                chosen = s
+                break
+        if chosen is None:
+            for s in segs:
+                d, _ = _usable(s, 0)
+                if MIN_REF_SECONDS <= d <= MAX_REF_SECONDS:
+                    chosen = s
+                    break
+        if chosen is None:
+            for s in segs:
+                d, _ = _usable(s, 0)
+                if d >= MIN_REF_SECONDS:
+                    chosen = s
+                    break
+        if chosen is None:
+            continue
+        start = max(0.0, chosen.start_ms / 1000.0 - 0.3)
+        dur = min(MAX_REF_SECONDS, max(MIN_REF_SECONDS,
+                 (chosen.end_ms - chosen.start_ms) / 1000.0 + 0.4))
+        clip_path = clip_dir / f"{spk}_ref.wav"
+        cmd = [ffmpeg, "-y", "-i", str(audio_wav), "-ss", f"{start:.2f}",
+               "-t", f"{dur:.2f}", "-ac", "1", "-ar", "16000",
+               "-c:a", "pcm_s16le", str(clip_path)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not Path(clip_path).exists():
+            log(f"voice ref clip failed for {spk}: {r.stderr[-200:]}", "WARN")
+            continue
+        # ref_text: prefer substantive text from this speaker (cloning uses it as transcript)
+        ref_text = chosen.original_text.strip()
+        if sum(1 for c in ref_text if c.isalpha()) < 12:
+            for s in sorted(segs, key=lambda s: s.end_ms - s.start_ms, reverse=True):
+                t = s.original_text.strip()
+                if sum(1 for c in t if c.isalpha()) >= 12:
+                    ref_text = t
+                    break
+        refs[spk] = (str(clip_path), ref_text)
+        log(f"Voice ref {spk}: {dur:.1f}s clip, text='{ref_text[:60]}'")
+    return refs
+
+
+def create_tts_engine(engine_name, qwen_size="0.6b", qwen_model_path=None,
+                      voice_clone=False, edge_voice="en-US-AriaNeural"):
     if engine_name == "qwen":
-        return QwenTTS(model_id=model_id, local_dir=local_dir)
+        kind = "base" if voice_clone else "custom"
+        return QwenTTS(size=qwen_size, kind=kind, model_path=qwen_model_path)
     if engine_name == "edge":
         return EdgeTTS(voice=edge_voice)
     if engine_name == "pyttsx3":
@@ -616,7 +742,8 @@ def merge_video_audio(video_path, dubbed_wav, output_mp4,
 # ─── Pipeline ────────────────────────────────────────────────────
 
 def run_pipeline(video_path, source_lang, target_lang, output_dir,
-                 tts_engine="auto", qwen_model_id=None, qwen_local_dir=None,
+                 tts_engine="auto", qwen_size="0.6b", qwen_model_path=None,
+                 voice_clone=False,
                  male_voice=None, female_voice=None, no_diarization=False,
                  whisper_model="medium", hy_mt_model=None,
                  remove_original=True):
@@ -682,8 +809,24 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
         json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
 
     # Stage 4
-    edge_voice = v_female  # default for Edge (overridden per segment)
-    engine = create_tts_engine(engine_name, qwen_model_id, qwen_local_dir, edge_voice)
+    clone_mode = (voice_clone and engine_name == "qwen")
+    if clone_mode:
+        # voice-clone: key voices by speaker label (SPEAKER_01, ...) not by gender
+        for s in segments:
+            s.voice = s.speaker
+        log("Voice-clone: selecting reference clips per speaker...")
+        refs = select_voice_references(segments, str(audio_wav), artifacts_dir)
+        if not refs:
+            log("No usable voice refs — falling back to named speakers", "WARN")
+            clone_mode = False
+            for s in segments:
+                s.voice = v_female
+    edge_voice = v_female
+    engine = create_tts_engine(engine_name, qwen_size=qwen_size,
+                               qwen_model_path=qwen_model_path,
+                               voice_clone=clone_mode, edge_voice=edge_voice)
+    if clone_mode:
+        engine.set_references(refs)
     generate_all_tts(segments, artifacts_dir, engine, engine_name, target_lang)
 
     # Stage 5
@@ -713,8 +856,12 @@ def main():
                         "Edge-TTS fallback: uk,pl,tr,ar,hi,vi,nl,cs,sv,el,fi,da,he,th,id,ms,ro,hu,fa,bg")
     p.add_argument("--tts-engine", default="auto", choices=["auto", "qwen", "edge", "pyttsx3"],
                    help="auto = Qwen if target supported, else Edge (default)")
+    p.add_argument("--qwen-size", default="0.6b", choices=["0.6b", "1.7b"],
+                   help="Qwen3-TTS model size (default 0.6b; 1.7b = better quality, slower)")
+    p.add_argument("--voice-clone", action="store_true",
+                   help="clone the original speakers' voices (Qwen3-TTS Base model, needs ~3-10s per speaker)")
     p.add_argument("--qwen-model", default=None,
-                   help="Qwen3-TTS model id or local dir (default Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)")
+                   help="explicit Qwen3-TTS model id or local dir (overrides --qwen-size/--voice-clone)")
     p.add_argument("--male-voice", default=None, help="override male voice name")
     p.add_argument("--female-voice", default=None, help="override female voice name")
     p.add_argument("--no-diarization", action="store_true",
@@ -735,7 +882,9 @@ def main():
         target_lang=(a.target_lang or "").lower() or None,
         output_dir=a.output,
         tts_engine=a.tts_engine,
-        qwen_model_id=a.qwen_model,
+        qwen_size=a.qwen_size,
+        qwen_model_path=a.qwen_model,
+        voice_clone=a.voice_clone,
         male_voice=a.male_voice,
         female_voice=a.female_voice,
         no_diarization=a.no_diarization,
