@@ -442,7 +442,8 @@ def assign_speakers(segments, audio_path, male_voice, female_voice, max_clusters
 
 # ─── Stage 3: Translation (Hy-MT, parameterized source/target) ──
 
-def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang, config=None):
+def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang,
+                       batch_size=3, config=None):
     """Translate segments source → target. src_lang/tgt_lang: ISO codes or None (auto)."""
     from llama_cpp import Llama
 
@@ -506,23 +507,83 @@ def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang, config=No
         return True  # latin-based: accept any non-empty text
 
     ok = fail = 0
-    for i, seg in enumerate(to_translate):
+
+    def _clean(t):
+        # strip quotes/markdown artifacts LLMs sometimes add
+        t = t.strip()
+        if len(t) > 2 and t[0] in "\"'“”‘’" and t[-1] in "\"'“”‘’":
+            t = t[1:-1]
+        return t.strip()
+
+    def _one(seg):
+        """Translate a single segment. Returns (text, ok_flag)."""
+        out = llm(prompt=prompt_prefix + seg.corrected_text.strip(),
+                  max_tokens=256, temperature=0.3, repeat_penalty=1.1, echo=False)
+        result = _clean("".join(c["text"] for c in out["choices"]))
+        if result and has_target_script(result):
+            return result, True
+        return (seg.corrected_text or seg.original_text), False
+
+    def _batch(batch):
+        """Translate several segments in ONE prompt. Returns (results, all_ok)."""
+        lines = "\n".join(f"{i+1}. {s.corrected_text.strip()}"
+                          for i, s in enumerate(batch))
+        prompt = (f"Translate the {len(batch)} numbered {src_name or ''} lines into "
+                  f"{tgt_name or 'the target language'}.\n"
+                  f"Rules: keep the same number of numbered lines, same numbers, "
+                  f"only the translation on each line, no explanations.\n\n{lines}")
+        out = llm(prompt=prompt,
+                  max_tokens=64 * len(batch) + 64, temperature=0.3,
+                  repeat_penalty=1.1, echo=False)
+        text = _clean("".join(c["text"] for c in out["choices"]))
+        # parse numbered lines
+        parts = {}
+        for line in text.splitlines():
+            m = re.match(r"^\s*(\d+)[\.\):\-]?\s+(.+)$", line)
+            if m:
+                parts[int(m.group(1))] = _clean(m.group(2))
+        if len(parts) < len(batch):
+            return None  # caller falls back to per-segment
+        results = []
+        for i, s in enumerate(batch):
+            t = parts.get(i + 1, "")
+            results.append((t, bool(t and has_target_script(t))))
+        return results, True
+
+    # batch sizing: 1 = per-segment, 3 = default (short segments per prompt)
+    BATCH = max(1, int(batch_size))
+    i = 0
+    while i < len(to_translate):
+        batch = to_translate[i:i + BATCH]
+        done = 0
         try:
-            out = llm(prompt=prompt_prefix + seg.corrected_text.strip(),
-                      max_tokens=256, temperature=0.3, repeat_penalty=1.1, echo=False)
-            result = "".join(c["text"] for c in out["choices"]).strip()
-            if result and has_target_script(result):
-                seg.translated_text = result
-                ok += 1
-            else:
-                seg.translated_text = seg.corrected_text or seg.original_text
-                fail += 1
+            res = _batch(batch)
+            if res:
+                results, _ = res
+                for s, (t, good) in zip(batch, results):
+                    s.translated_text = t
+                    if good:
+                        ok += 1
+                    else:
+                        fail += 1
+                    done += 1
         except Exception as e:
-            seg.translated_text = seg.corrected_text or seg.original_text
-            fail += 1
-            log(f"seg {seg.index} failed: {e}", "WARN")
-        if (i + 1) % 20 == 0 or i == len(to_translate) - 1:
-            log(f"Translation: {i+1}/{len(to_translate)} ({ok} OK, {fail} fallback)")
+            log(f"batch failed at seg {batch[0].index}: {e}", "WARN")
+        if done == 0:  # fallback: per-segment
+            for s in batch:
+                try:
+                    t, good = _one(s)
+                    s.translated_text = t
+                    ok += good
+                    fail += (not good)
+                except Exception as e:
+                    s.translated_text = s.corrected_text or s.original_text
+                    fail += 1
+                    log(f"seg {s.index} failed: {e}", "WARN")
+                done += 1
+        i += len(batch)
+        if i % 15 < len(batch) or i >= len(to_translate):
+            log(f"Translation: {i}/{len(to_translate)} ({ok} OK, {fail} fallback)")
 
     for seg in segments:
         if not seg.translated_text.strip():
@@ -746,7 +807,7 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
                  voice_clone=False,
                  male_voice=None, female_voice=None, no_diarization=False,
                  whisper_model="medium", hy_mt_model=None,
-                 remove_original=True):
+                 batch_size=3, remove_original=True):
     video_path = Path(video_path).resolve()
     output_dir = Path(output_dir)
     artifacts_dir = output_dir / "artifacts"
@@ -804,7 +865,8 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
             s.voice = v_female
 
     # Stage 3
-    segments = translate_segments(segments, hy_mt_model, source_lang, target_lang)
+    segments = translate_segments(segments, hy_mt_model, source_lang, target_lang,
+                                  batch_size=batch_size)
     with open(artifacts_dir / f"{ts}_{stem}_translated.json", "w", encoding="utf-8") as f:
         json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
 
@@ -871,6 +933,8 @@ def main():
     p.add_argument("--hy-mt-model",
                    default=r"G:\work\hermes\vvp-translate\.models\HY-MT1.5-1.8B-Q4_K_M.gguf",
                    help="path to Hy-MT GGUF")
+    p.add_argument("--batch-size", type=int, default=3,
+                   help="segments per translation prompt (default 3; 1 = one by one, slow but safest)")
     p.add_argument("--keep-original-audio", action="store_true",
                    help="mix original under dubbed instead of replacing")
     p.add_argument("--output", default="./output")
@@ -890,6 +954,7 @@ def main():
         no_diarization=a.no_diarization,
         whisper_model=a.whisper_model,
         hy_mt_model=a.hy_mt_model,
+        batch_size=a.batch_size,
         remove_original=not a.keep_original_audio,
     )
 

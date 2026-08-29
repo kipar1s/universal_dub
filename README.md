@@ -130,6 +130,32 @@ universal_dub/
 - **Voice clone**: не подключено (модель Qwen3-TTS-12Hz-Base, ~5 GB) — в планах
 - **Перевод uk**: Hy-MT путает ru/uk — для uk-оригинала ставьте `--source-lang uk`
 
+## Быстродействие
+
+### Batch-перевод
+По умолчанию 3 сегмента переводятся одним промптом (вместо 3 отдельных LLM-вызовов).
+Если LLM нарушил нумерацию/формат — автоматический fallback на поштучный перевод.
+
+```bat
+--batch-size 3     :: default
+--batch-size 1     :: по одному сегменту (максимальная надёжность)
+```
+
+### CUDA-сборка llama-cpp (GPU-перевод, x3-x5 быстрее)
+В этом окружении уже собрана с CUDA 13.3. Для повторной сборки:
+
+```bat
+G:\universal_dub\build_llama_cuda.bat
+```
+
+Требования: MSVC 2022 (VS Community), CUDA Toolkit, cmake 3.31 (4.x ломает
+определение CUDA-компилятора на Windows). Проверка:
+
+```bat
+.venv\Scripts\python.exe -c "import llama_cpp; print(llama_cpp.llama_supports_gpu_offload())"
+:: True = GPU offload работает
+```
+
 ## Дорожная карта
 
 - [x] Voice clone (Qwen3-TTS-12Hz-Base) — клонировать голоса актёров оригинала
