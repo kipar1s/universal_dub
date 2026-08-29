@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Models (~GB)
+models/
+
+# Outputs
+output/
+test_out*/
+e2e_clip.mp4
+test_*.wav
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Videos
+input/
+*.mp4
