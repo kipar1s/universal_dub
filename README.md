@@ -160,8 +160,8 @@ G:\universal_dub\build_llama_cuda.bat
 
 - [x] Voice clone (Qwen3-TTS-12Hz-Base) — клонировать голоса актёров оригинала
 - [x] 1.7B модель (качество выше) — `--qwen-size 1.7b`
-- [ ] CUDA-сборка llama-cpp (перевод x5 быстрее)
-- [ ] Batch-перевод (один промпт на 5–10 сегментов)
+- [x] CUDA-сборка llama-cpp — перевод 8.6x быстрее (0.19 c/сегмент, RTX 3090)
+- [x] Batch-перевод — 3 сегмента одним промптом, авто-fallback
 - [ ] A/B выбор голоса (auto-select по native language)
 - [ ] Web UI (Gradio/Streamlit)
 - [ ] Прогресс-бар (rich)
