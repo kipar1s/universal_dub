@@ -16,7 +16,7 @@ Usage:
   python universal_dub.py video.mp4 --target-lang uk --tts-engine edge
 """
 
-import os, sys, json, re, subprocess, argparse, shutil, wave
+import os, sys, json, re, time, subprocess, argparse, shutil, wave
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -25,6 +25,8 @@ from typing import List, Optional
 
 # ─── ffmpeg ──────────────────────────────────────────────────────
 _FFMPEG_EXE = r"C:\ffmpeg\bin\ffmpeg.exe"
+if not os.path.isfile(_FFMPEG_EXE):          # портативный fallback: ffmpeg из PATH
+    _FFMPEG_EXE = shutil.which("ffmpeg") or "ffmpeg"
 os.environ["FFMPEG"] = _FFMPEG_EXE
 _ffmpeg_dir = os.path.dirname(_FFMPEG_EXE)
 if os.path.isfile(_FFMPEG_EXE) and _ffmpeg_dir not in os.environ.get("PATH", ""):
@@ -120,7 +122,7 @@ def voices_for(target_lang: str, male_override=None, female_override=None):
     female = female_override
     if tl in QWEN_LANGUAGES:
         return male or QWEN_SPEAKERS[tl]["male"], female or QWEN_SPEAKERS[tl]["female"], "qwen"
-    edge = EDGE_VOICES.get(tl, ("", ""))
+    edge = EDGE_VOICES.get(tl) or EDGE_VOICES["en"]  # неизвестный язык → англ. голоса, а не пустые
     return male or edge[0], female or edge[1], "edge"
 
 
@@ -172,6 +174,8 @@ class QwenTTS:
             dtype=torch.bfloat16,
         )
         self.clone = kind == "base"
+        self.speaker_ref = {}   # {speaker: (audio_path, ref_text)}
+        self.prompts = {}       # {speaker: VoiceClonePromptItem} (предвычислены один раз)
         if self.clone:
             log("[QwenTTS] Voice-clone mode (Base model)")
         else:
@@ -183,33 +187,110 @@ class QwenTTS:
 
     def set_references(self, speaker_ref):
         """speaker_ref: {speaker_label: (audio_path, ref_text)} for clone mode."""
-        self.speaker_ref = speaker_ref
-        log(f"[QwenTTS] Voice refs set for: {list(speaker_ref)}")
+        self.speaker_ref = dict(speaker_ref or {})
+        log(f"[QwenTTS] Voice refs set for: {list(self.speaker_ref)}")
+        self._prepare_prompts()
+
+    def _prepare_prompts(self):
+        """Один раз на спикера закодировать референс (VQ-коды + speaker embedding).
+
+        Без этого каждый вызов generate_voice_clone() заново читает и
+        энкодирует весь клип референса (12 с аудио) — это и была главная
+        причина медленного TTS на 400+ сегментах.
+        """
+        if not self.clone or not self.speaker_ref:
+            return
+        ok = 0
+        for spk, (audio, text) in self.speaker_ref.items():
+            try:
+                items = self.model.create_voice_clone_prompt(
+                    ref_audio=str(audio), ref_text=text, x_vector_only_mode=False)
+                if items:
+                    self.prompts[spk] = items[0]
+                    ok += 1
+            except Exception as e:
+                log(f"[QwenTTS] prompt prep failed for {spk}: {e}", "WARN")
+        if ok:
+            log(f"[QwenTTS] Voice-clone prompts ready: {ok}/{len(self.speaker_ref)}")
+        else:
+            log("[QwenTTS] no precomputed prompts — encoding per call (slower)", "WARN")
+
+    def _clone_prompt_for(self, voice):
+        item = self.prompts.get(voice)
+        if item is None and self.prompts:
+            item = next(iter(self.prompts.values()))
+        return item
 
     def generate_sync(self, text, output_path, language=None, voice=None):
         import soundfile as sf
+        lang = language or "Auto"
         if self.clone:
-            ref = self.speaker_ref.get(voice) or (self.speaker_ref or {}).get(voice, None)
-            if ref is None and self.speaker_ref:
-                ref = next(iter(self.speaker_ref.values()))
-            if ref is None:
-                raise RuntimeError("voice-clone mode: no reference audio set "
-                                   "(set via QwenTTS.set_references)")
-            ref_audio, ref_text = ref
-            wavs, sr = self.model.generate_voice_clone(
-                text=text,
-                language=language or "Auto",
-                ref_audio=str(ref_audio),
-                ref_text=ref_text,
-                non_streaming_mode=True,
-            )
+            item = self._clone_prompt_for(voice)
+            if item is not None:
+                wavs, sr = self.model.generate_voice_clone(
+                    text=text, language=lang,
+                    voice_clone_prompt=[item], non_streaming_mode=True)
+            else:
+                # fallback: библиотека сама кодирует референс на лету (медленнее)
+                ref = None
+                if self.speaker_ref:
+                    ref = self.speaker_ref.get(voice) or next(iter(self.speaker_ref.values()))
+                if ref is None:
+                    raise RuntimeError("voice-clone mode: no reference audio set "
+                                       "(set via QwenTTS.set_references)")
+                ref_audio, ref_text = ref
+                wavs, sr = self.model.generate_voice_clone(
+                    text=text, language=lang,
+                    ref_audio=str(ref_audio), ref_text=ref_text,
+                    non_streaming_mode=True)
         else:
             wavs, sr = self.model.generate_custom_voice(
-                text=text,
-                language=language or "Auto",
-                speaker=voice,
-            )
+                text=text, language=lang, speaker=voice)
         sf.write(str(output_path), np.asarray(wavs[0], dtype=np.float32), sr)
+
+    def generate_batch_sync(self, items, output_paths, language=None, batch_size=8):
+        """Пакетное озвучивание списка (text, voice) — батчами по batch_size.
+
+        Один model.generate() на чанк (padded batch) заметно быстрее N
+        последовательных вызовов. Сбой батча → автоматический fallback
+        на поштучный generate_sync(). Возвращает (ok, fail).
+        """
+        if len(items) != len(output_paths):
+            raise ValueError("items/output_paths length mismatch")
+        import soundfile as sf
+        lang = language or "Auto"
+        ok = fail = 0
+        for i in range(0, len(items), batch_size):
+            chunk = items[i:i + batch_size]
+            paths = output_paths[i:i + batch_size]
+            texts = [t for t, _ in chunk]
+            try:
+                if self.clone:
+                    chunk_prompts = [self._clone_prompt_for(v) for _, v in chunk]
+                    if any(p is None for p in chunk_prompts):
+                        raise RuntimeError("no precomputed voice-clone prompts")
+                    wavs, sr = self.model.generate_voice_clone(
+                        text=texts, language=lang,
+                        voice_clone_prompt=chunk_prompts, non_streaming_mode=True)
+                else:
+                    wavs, sr = self.model.generate_custom_voice(
+                        text=texts, language=lang,
+                        speaker=[v for _, v in chunk])
+                if len(wavs) != len(texts):
+                    raise RuntimeError(f"expected {len(texts)} wavs, got {len(wavs)}")
+                for wav, p in zip(wavs, paths):
+                    sf.write(str(p), np.asarray(wav, dtype=np.float32), sr)
+                ok += len(chunk)
+            except Exception as e:
+                log(f"[QwenTTS] batch of {len(chunk)} failed ({e}) — per-segment fallback", "WARN")
+                for (t, v), p in zip(chunk, paths):
+                    try:
+                        self.generate_sync(t, str(p), language=language, voice=v)
+                        ok += 1
+                    except Exception as e2:
+                        fail += 1
+                        log(f"[QwenTTS] segment failed: {e2}", "WARN")
+        return ok, fail
 
 
 class EdgeTTS:
@@ -613,7 +694,7 @@ def select_voice_references(segments, audio_wav, artifacts_dir):
     clip_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg = _FFMPEG_EXE if os.path.isfile(_FFMPEG_EXE) else "ffmpeg"
 
-    def _usable(s, min_alpha):
+    def _usable(s):
         d = (s.end_ms - s.start_ms) / 1000.0
         alpha = sum(1 for c in s.original_text if c.isalpha())
         return d, alpha
@@ -624,19 +705,19 @@ def select_voice_references(segments, audio_wav, artifacts_dir):
         # else any 2-12s clip; else longest >= 2s
         chosen = None
         for s in segs:
-            d, a = _usable(s, 12)
+            d, a = _usable(s)
             if MIN_REF_SECONDS <= d <= MAX_REF_SECONDS and a >= 12:
                 chosen = s
                 break
         if chosen is None:
             for s in segs:
-                d, _ = _usable(s, 0)
+                d, _ = _usable(s)
                 if MIN_REF_SECONDS <= d <= MAX_REF_SECONDS:
                     chosen = s
                     break
         if chosen is None:
             for s in segs:
-                d, _ = _usable(s, 0)
+                d, _ = _usable(s)
                 if d >= MIN_REF_SECONDS:
                     chosen = s
                     break
@@ -653,14 +734,13 @@ def select_voice_references(segments, audio_wav, artifacts_dir):
         if r.returncode != 0 or not Path(clip_path).exists():
             log(f"voice ref clip failed for {spk}: {r.stderr[-200:]}", "WARN")
             continue
-        # ref_text: prefer substantive text from this speaker (cloning uses it as transcript)
+        # ref_text ОБЯЗАН быть транскриптом именно этого клипа: Qwen3-TTS в ICL-режиме
+        # использует пару (ref_text, ref_audio) вместе. Текст из другого сегмента
+        # рассинхронизирован с аудиой и ухудшает клонирование. (Выбор выше уже
+        # предпочитает клипы с содержательным текстом >= 12 символов.)
         ref_text = chosen.original_text.strip()
         if sum(1 for c in ref_text if c.isalpha()) < 12:
-            for s in sorted(segs, key=lambda s: s.end_ms - s.start_ms, reverse=True):
-                t = s.original_text.strip()
-                if sum(1 for c in t if c.isalpha()) >= 12:
-                    ref_text = t
-                    break
+            log(f"voice ref {spk}: короткий транскрипт ({ref_text!r}) — клон может быть слабее", "WARN")
         refs[spk] = (str(clip_path), ref_text)
         log(f"Voice ref {spk}: {dur:.1f}s clip, text='{ref_text[:60]}'")
     return refs
@@ -678,7 +758,26 @@ def create_tts_engine(engine_name, qwen_size="0.6b", qwen_model_path=None,
     raise ValueError(f"unknown engine {engine_name}")
 
 
-def generate_all_tts(segments, output_dir, engine, engine_name, target_lang):
+def _tts_name(seg):
+    return f"{seg.index:04d}_{int(seg.start_ms):06d}-{int(seg.end_ms):06d}.wav"
+
+
+def _tts_duration_bad(pth, seg):
+    """Защита от «разбегавшейся» генерации (batch-режим qwen_tts иногда
+    не останавливается на EOS и выдаёт десятки минут тишости/повторов).
+    Короткая фраза не может звучать втрое дольше оригинала и дольше 15 с.
+    """
+    try:
+        with wave.open(str(pth), "rb") as wf:
+            dur = wf.getnframes() / max(wf.getframerate(), 1)
+    except Exception:
+        return False
+    src = max((seg.end_ms - seg.start_ms) / 1000.0, 1.0)
+    return dur > 15.0 and dur > 3.0 * src
+
+
+def generate_all_tts(segments, output_dir, engine, engine_name, target_lang,
+                     tts_batch=1):
     tts_dir = output_dir / "tts_segments"
     tts_dir.mkdir(parents=True, exist_ok=True)
     to_gen = [s for s in segments if s.translated_text.strip()]
@@ -688,25 +787,58 @@ def generate_all_tts(segments, output_dir, engine, engine_name, target_lang):
         tts_language = QWEN_LANGUAGES.get(target_lang.lower(), "Auto")
     else:
         tts_language = target_lang  # ISO or None
+
+    # Resume: сегменты с уже готовым непустым (и нормальным по длительности) wav пропускаем
+    pending = []
+    for s in to_gen:
+        p = Path(s.tts_file) if s.tts_file else tts_dir / _tts_name(s)
+        if p.exists() and p.stat().st_size > 200 and not _tts_duration_bad(p, s):
+            s.tts_file = str(p)
+        else:
+            pending.append(s)
+    skipped = len(to_gen) - len(pending)
+    if skipped:
+        log(f"TTS resume: {skipped}/{len(to_gen)} already done, generating {len(pending)}")
     ok = fail = 0
-    for i, seg in enumerate(to_gen):
-        out_path = tts_dir / f"{seg.index:04d}_{int(seg.start_ms):06d}-{int(seg.end_ms):06d}.wav"
-        try:
-            engine.generate_sync(seg.translated_text, str(out_path),
-                                 language=tts_language, voice=seg.voice)
-            p = Path(out_path)
-            if p.exists() and p.stat().st_size > 0:
-                seg.tts_file = str(out_path)
-                ok += 1
-            else:
-                fail += 1
-        except Exception as e:
+    t0 = time.time()
+
+    batch_fn = getattr(engine, "generate_batch_sync", None)
+    if batch_fn and pending and tts_batch > 1:
+        # QwenTTS: пакетный вызов (экспериментально — см. --tts-batch)
+        items = [(s.translated_text, s.voice) for s in pending]
+        paths = [str(tts_dir / _tts_name(s)) for s in pending]
+        log(f"TTS batch mode: {len(pending)} segments, batch={tts_batch}")
+        batch_fn(items, paths, language=tts_language, batch_size=max(2, tts_batch))
+    # Финальный прогон по каждому сегменту: валидация файла (размер + длительность),
+    # догенерация по одному сегменту при битом/разбежавшемся wav.
+    ok = fail = 0
+    t0 = time.time()
+    for i, seg in enumerate(pending):
+        out_path = tts_dir / _tts_name(seg)
+        p = Path(out_path)
+        good = p.exists() and p.stat().st_size > 200 and not _tts_duration_bad(p, seg)
+        if not good and p.exists():
+            log(f"seg {seg.index}: suspicious wav ({p.stat().st_size} B) — regenerating", "WARN")
+            p.unlink(missing_ok=True)
+        if not good:
+            try:
+                engine.generate_sync(seg.translated_text, str(out_path),
+                                     language=tts_language, voice=seg.voice)
+                p = Path(out_path)
+                good = p.exists() and p.stat().st_size > 200 and not _tts_duration_bad(p, seg)
+            except Exception as e:
+                log(f"TTS failed seg {seg.index}: {e}", "WARN")
+        if good:
+            seg.tts_file = str(out_path)
+            ok += 1
+        else:
             fail += 1
-            log(f"TTS failed seg {seg.index}: {e}", "WARN")
-        if (i + 1) % 20 == 0 or i == len(to_gen) - 1:
-            log(f"TTS: {i+1}/{len(to_gen)} ({ok} OK, {fail} failed)")
-    log(f"TTS complete: {ok}/{len(to_gen)}")
-    if to_gen and ok == 0:
+            log(f"TTS failed seg {seg.index} (no valid audio)", "WARN")
+        if (i + 1) % 10 == 0 or i == len(pending) - 1:
+            log(f"TTS: {i+1}/{len(pending)} ({ok} OK, {fail} failed) [{time.time()-t0:.0f}s]")
+    done_total = ok + skipped
+    log(f"TTS complete: {done_total}/{len(to_gen)} in {time.time()-t0:.0f}s")
+    if to_gen and done_total == 0:
         raise RuntimeError(
             f"TTS failed for all {len(to_gen)} segments — check engine/voice/language. "
             f"(engine={engine_name}, language={tts_language}, voices={set(s.voice for s in to_gen)})")
@@ -807,7 +939,7 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
                  voice_clone=False,
                  male_voice=None, female_voice=None, no_diarization=False,
                  whisper_model="medium", hy_mt_model=None,
-                 batch_size=3, remove_original=True):
+                 batch_size=3, tts_batch=1, remove_original=True):
     video_path = Path(video_path).resolve()
     output_dir = Path(output_dir)
     artifacts_dir = output_dir / "artifacts"
@@ -889,7 +1021,8 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
                                voice_clone=clone_mode, edge_voice=edge_voice)
     if clone_mode:
         engine.set_references(refs)
-    generate_all_tts(segments, artifacts_dir, engine, engine_name, target_lang)
+    generate_all_tts(segments, artifacts_dir, engine, engine_name, target_lang,
+                     tts_batch=tts_batch)
 
     # Stage 5
     dubbed_wav = artifacts_dir / f"{ts}_{stem}_dubbed.wav"
@@ -913,7 +1046,7 @@ def main():
     p.add_argument("video", help="input video file")
     p.add_argument("--source-lang", default=None,
                    help="source language ISO code (en, uk, de, ...). Default: auto-detect")
-    p.add_argument("--target-lang", default="ru", required=True,
+    p.add_argument("--target-lang", default="ru",
                    help="target language ISO code. Qwen3-TTS: zh,en,ja,ko,de,fr,ru,pt,es,it. "
                         "Edge-TTS fallback: uk,pl,tr,ar,hi,vi,nl,cs,sv,el,fi,da,he,th,id,ms,ro,hu,fa,bg")
     p.add_argument("--tts-engine", default="auto", choices=["auto", "qwen", "edge", "pyttsx3"],
@@ -935,6 +1068,10 @@ def main():
                    help="path to Hy-MT GGUF")
     p.add_argument("--batch-size", type=int, default=3,
                    help="segments per translation prompt (default 3; 1 = one by one, slow but safest)")
+    p.add_argument("--tts-batch", type=int, default=1,
+                   help="TTS segments per batched Qwen call. 1 = sequential (default, надёжно); "
+                        ">1 = experimental batch (qwen_tts 0.1.1 may produce runaway audio in batches, "
+                        "suspicious wavs are auto-detected and regenerated one-by-one)")
     p.add_argument("--keep-original-audio", action="store_true",
                    help="mix original under dubbed instead of replacing")
     p.add_argument("--output", default="./output")
@@ -955,6 +1092,7 @@ def main():
         whisper_model=a.whisper_model,
         hy_mt_model=a.hy_mt_model,
         batch_size=a.batch_size,
+        tts_batch=a.tts_batch,
         remove_original=not a.keep_original_audio,
     )
 
