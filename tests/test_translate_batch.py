@@ -40,17 +40,22 @@ class MockLlama:
 
 
 def _patch_llama(monkeypatch_llm):
+    """Fake llama_cpp AND torch in sys.modules so translate_segments never
+    imports the real torch (slow Windows DLL load / hangs in CI)."""
     import types
     fake = types.ModuleType("llama_cpp")
     fake.Llama = monkeypatch_llm
     fake.llama_supports_gpu_offload = lambda: False
-    return fake
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+    return fake, fake_torch
 
 
 def test_batch_translation_happy_path(tmp_path, monkeypatch):
     import types, sys as _sys
-    fake = _patch_llama(MockLlama)
+    fake, fake_torch = _patch_llama(MockLlama)
     _sys.modules["llama_cpp"] = fake
+    _sys.modules["torch"] = fake_torch
     monkeypatch.setattr(ud, "log", lambda *a, **k: None)  # silence
 
     # model file must exist for the code path
@@ -77,7 +82,7 @@ def test_batch_fallback_on_bad_output(tmp_path, monkeypatch):
                 return {"choices": [{"text": "garbage without numbers"}]}
             return super().__call__(prompt, **kw)
 
-    _sys.modules["llama_cpp"] = _patch_llama(BrokenBatch)
+    _sys.modules["llama_cpp"], _sys.modules["torch"] = _patch_llama(BrokenBatch)
     monkeypatch.setattr(ud, "log", lambda *a, **k: None)
 
     model_file = tmp_path / "fake.gguf"
@@ -91,7 +96,7 @@ def test_batch_fallback_on_bad_output(tmp_path, monkeypatch):
 
 def test_batch_size_one(tmp_path, monkeypatch):
     import types, sys as _sys
-    _sys.modules["llama_cpp"] = _patch_llama(MockLlama)
+    _sys.modules["llama_cpp"], _sys.modules["torch"] = _patch_llama(MockLlama)
     monkeypatch.setattr(ud, "log", lambda *a, **k: None)
 
     model_file = tmp_path / "fake.gguf"

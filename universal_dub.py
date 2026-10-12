@@ -23,6 +23,14 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
+# Windows-консоль (cp866/cp1251) не кодирует часть Unicode из логов (→ ✓ ⏳ ✗).
+# Оставляем нативную кодировку, но никогда не падаем на неэнкодируемых символах.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # ─── ffmpeg ──────────────────────────────────────────────────────
 _FFMPEG_EXE = r"C:\ffmpeg\bin\ffmpeg.exe"
 if not os.path.isfile(_FFMPEG_EXE):          # портативный fallback: ffmpeg из PATH
@@ -32,9 +40,36 @@ _ffmpeg_dir = os.path.dirname(_FFMPEG_EXE)
 if os.path.isfile(_FFMPEG_EXE) and _ffmpeg_dir not in os.environ.get("PATH", ""):
     os.environ["PATH"] = _ffmpeg_dir + ";" + os.environ.get("PATH", "")
 
+# ─── SoX (нужен qwen_tts 25Hz VQ tokenizer; без него — warning при импорте) ──
+_SOX_DIR = r"C:\tools\sox"
+if os.path.isdir(_SOX_DIR) and _SOX_DIR not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _SOX_DIR + ";" + os.environ.get("PATH", "")
+
+# ─── Hy-MT default model (translation stage) ─────────────────────
+DEFAULT_HY_MT_MODEL = r"G:\work\hermes\vvp-translate\.models\HY-MT1.5-1.8B-Q4_K_M.gguf"
+
 
 def log(msg, level="INFO"):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{level}] {msg}")
+
+
+# ─── Progress hooks (Web UI) ─────────────────────────────────────
+
+_progress_cb = None  # fn(stage: str, done: int, total: int)
+
+
+def set_progress_callback(cb):
+    """Register a progress callback (used by webui.py). Pass None to clear."""
+    global _progress_cb
+    _progress_cb = cb
+
+
+def report_progress(stage, done, total):
+    if _progress_cb is not None:
+        try:
+            _progress_cb(stage, int(done), int(total))
+        except Exception:
+            pass
 
 
 # ─── Languages registry ──────────────────────────────────────────
@@ -142,6 +177,12 @@ QWEN_MODELS = {
 
 MIN_REF_SECONDS = 2.0     # min reference clip for voice clone
 MAX_REF_SECONDS = 12.0    # max reference clip
+
+# Chatterbox Multilingual V3: 23 supported languages (ISO codes)
+CHATTERBOX_LANGUAGES = {
+    "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja",
+    "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh",
+}
 
 
 def resolve_qwen_model(size="0.6b", kind="custom", explicit=None):
@@ -293,6 +334,54 @@ class QwenTTS:
         return ok, fail
 
 
+class ChatterboxTTS:
+    """Chatterbox Multilingual V3 (local, GPU). 23 languages + voice cloning.
+
+    Voice cloning is built-in: pass reference clips via set_references();
+    without refs the model uses its default speaker (conds.pt).
+    """
+
+    def __init__(self, device="cuda"):
+        import torch
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        log(f"[Chatterbox] Loading Multilingual V3 on {self.device} ...")
+        self.model = ChatterboxMultilingualTTS.from_pretrained(
+            device=self.device, t3_model="v3")
+        self.sr = self.model.sr  # 24000
+        self.refs = {}   # {speaker: Conditionals} — precomputed per speaker
+        log(f"[Chatterbox] Ready. sr={self.sr}, languages: {len(CHATTERBOX_LANGUAGES)}")
+
+    def set_references(self, speaker_ref):
+        """Precompute conditionals once per speaker (avoids re-encoding the ref
+        clip on every segment — same optimization as QwenTTS._prepare_prompts)."""
+        ok = 0
+        for spk, (audio, _text) in (speaker_ref or {}).items():
+            try:
+                self.model.prepare_conditionals(audio)
+                # prepare_conditionals creates a fresh Conditionals object each call — keep it
+                self.refs[spk] = self.model.conds
+                ok += 1
+            except Exception as e:
+                log(f"[Chatterbox] ref prep failed for {spk}: {e}", "WARN")
+        if speaker_ref and not ok:
+            log("[Chatterbox] no refs prepared — using default voice", "WARN")
+        elif ok:
+            log(f"[Chatterbox] Voice refs ready: {ok}/{len(speaker_ref)}")
+
+    def generate_sync(self, text, output_path, language=None, voice=None):
+        import torch
+        import numpy as np
+        import soundfile as sf
+        lang = (language or "en").lower()
+        if self.refs:
+            # restore precomputed conditionals for this speaker (fallback: first ref)
+            self.model.conds = self.refs.get(voice) or next(iter(self.refs.values()))
+        wav = self.model.generate(text=text, language_id=lang)
+        arr = np.squeeze(wav.cpu().numpy() if torch.is_tensor(wav) else np.asarray(wav))
+        sf.write(str(output_path), arr.astype(np.float32), self.sr)  # squeeze: soundfile 0.14 chokes on (1,N)
+
+
 class EdgeTTS:
     """Edge-TTS (cloud). 75 languages, many neural voices per language."""
 
@@ -423,10 +512,25 @@ def group_words_into_segments(raw_segments):
 
 
 def transcribe_audio(audio_path, whisper_model="medium", language=None, device_hint="auto"):
+    """Transcribe audio with openai-whisper (word-level timestamps).
+
+    Returns a list of Segment (via group_words_into_segments).
+    """
+    import torch
     import whisper
+    # Защита от конфликта пакетов: в site-packages может лежать чужой
+    # однофайловый модуль whisper (graphite 'whisper.py'), который НЕ имеет
+    # load_model. Без проверки он молча вернул бы не-сегменты и сломал бы
+    # весь пайплайн (см. баг: return model, processor).
+    if not hasattr(whisper, "load_model"):
+        raise RuntimeError(
+            "Imported 'whisper' is not openai-whisper (has no load_model). "
+            "Fix:  pip uninstall -y whisper        # remove the conflicting graphite package\n"
+            "      pip install openai-whisper"
+        )
     log(f"Loading Whisper model '{whisper_model}'...")
-    device = "cuda" if (device_hint in ("auto", "cuda") and
-                        __import__("torch").cuda.is_available()) else "cpu"
+    device = "cuda" if (device_hint in ("auto", "cuda") and torch.cuda.is_available()) else "cpu"
+    log(f"Using device: {device}")
     model = whisper.load_model(whisper_model, device=device)
     log(f"Transcribing (language={language or 'auto-detect'})...")
     result = model.transcribe(str(audio_path), language=language,
@@ -528,8 +632,8 @@ def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang,
     """Translate segments source → target. src_lang/tgt_lang: ISO codes or None (auto)."""
     from llama_cpp import Llama
 
-    if not os.path.exists(hy_mt_model_path):
-        log(f"Hy-MT model not found ({hy_mt_model_path}) — using original text", "WARN")
+    if not hy_mt_model_path or not os.path.exists(hy_mt_model_path):
+        log(f"Hy-MT model not found at {hy_mt_model_path!r} — using source text as-is", "WARN")
         for s in segments:
             s.translated_text = s.corrected_text or s.original_text
         return segments
@@ -665,6 +769,7 @@ def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang,
         i += len(batch)
         if i % 15 < len(batch) or i >= len(to_translate):
             log(f"Translation: {i}/{len(to_translate)} ({ok} OK, {fail} fallback)")
+        report_progress("translate", i, len(to_translate))
 
     for seg in segments:
         if not seg.translated_text.strip():
@@ -674,20 +779,23 @@ def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang,
 
 # ─── Stage 4: TTS generation ─────────────────────────────────────
 
-def select_voice_references(segments, audio_wav, artifacts_dir):
-    """Pick the best reference clip per speaker for voice cloning.
+def select_voice_references(segments, audio_wav, artifacts_dir, group_key=None):
+    """Pick the best reference clip per group for voice cloning.
 
-    Strategy: per speaker, choose the longest voiced segment with
+    Strategy: per group, choose the longest voiced segment with
     2s <= duration <= 12s (fallback: longest >= 2s, trimmed to 12s).
     Clips are cut from the ORIGINAL audio with ffmpeg.
 
-    Returns {speaker_label: (clip_path, ref_text)} or {} if no usable refs.
+    group_key: callable segment -> label (default: s.speaker; pass
+    lambda s: s.voice for per-gender refs in named-speaker mode).
+
+    Returns {label: (clip_path, ref_text)} or {} if no usable refs.
     """
     from collections import defaultdict
     by_spk = defaultdict(list)
     for s in segments:
         if s.original_text.strip():
-            by_spk[s.speaker].append(s)
+            by_spk[group_key(s) if group_key else s.speaker].append(s)
 
     refs = {}
     clip_dir = Path(artifacts_dir) / "voice_refs"
@@ -751,6 +859,8 @@ def create_tts_engine(engine_name, qwen_size="0.6b", qwen_model_path=None,
     if engine_name == "qwen":
         kind = "base" if voice_clone else "custom"
         return QwenTTS(size=qwen_size, kind=kind, model_path=qwen_model_path)
+    if engine_name == "chatterbox":
+        return ChatterboxTTS()
     if engine_name == "edge":
         return EdgeTTS(voice=edge_voice)
     if engine_name == "pyttsx3":
@@ -836,6 +946,7 @@ def generate_all_tts(segments, output_dir, engine, engine_name, target_lang,
             log(f"TTS failed seg {seg.index} (no valid audio)", "WARN")
         if (i + 1) % 10 == 0 or i == len(pending) - 1:
             log(f"TTS: {i+1}/{len(pending)} ({ok} OK, {fail} failed) [{time.time()-t0:.0f}s]")
+        report_progress("tts", i + 1, len(pending))
     done_total = ok + skipped
     log(f"TTS complete: {done_total}/{len(to_gen)} in {time.time()-t0:.0f}s")
     if to_gen and done_total == 0:
@@ -855,9 +966,13 @@ def merge_tts_segments(segments, video_duration_ms, output_wav):
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     stretched = []
+    n_merge = sum(1 for s in segments if s.tts_file and Path(s.tts_file).exists())
+    done_merge = 0
     for seg in segments:
         if not seg.tts_file or not Path(seg.tts_file).exists():
             continue
+        done_merge += 1
+        report_progress("merge", done_merge, n_merge)
         orig = (seg.end_ms - seg.start_ms) / 1000.0
         if orig <= 0.05:
             continue
@@ -934,6 +1049,20 @@ def merge_video_audio(video_path, dubbed_wav, output_mp4,
 
 # ─── Pipeline ────────────────────────────────────────────────────
 
+def _find_artifact(artifacts_dir, stem, suffix):
+    """Найти артефакт по стабильному имени; fallback на старые имена вида {ts}_{stem}.
+
+    Fallback-глоб строгий (*_stem...): имя legacy-файла всегда начинается с
+    {ts}_, и нестрогий глоб *stem... мог бы подхватить файл ЧУЖОГО видео,
+    чей stem заканчивается тем же словом (напр. 'clip' vs 'my_clip').
+    """
+    p = Path(artifacts_dir) / f"{stem}{suffix}"
+    if p.exists():
+        return p
+    matches = sorted(Path(artifacts_dir).glob(f"*_{stem}{suffix}"))
+    return matches[-1] if matches else None
+
+
 def run_pipeline(video_path, source_lang, target_lang, output_dir,
                  tts_engine="auto", qwen_size="0.6b", qwen_model_path=None,
                  voice_clone=False,
@@ -946,6 +1075,8 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = video_path.stem
+    if hy_mt_model is None:
+        hy_mt_model = DEFAULT_HY_MT_MODEL
 
     # voices + engine resolution
     v_male, v_female, engine_hint = voices_for(target_lang or "ru",
@@ -953,6 +1084,9 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
     engine_name = tts_engine if tts_engine != "auto" else engine_hint
     if engine_name == "qwen" and not (target_lang or "").lower() in QWEN_LANGUAGES:
         log(f"Qwen3-TTS does not speak '{target_lang}' — falling back to Edge-TTS", "WARN")
+        engine_name = "edge"
+    if engine_name == "chatterbox" and not (target_lang or "").lower() in CHATTERBOX_LANGUAGES:
+        log(f"Chatterbox does not speak '{target_lang}' — falling back to Edge-TTS", "WARN")
         engine_name = "edge"
     if engine_name == "edge":
         edge_pair = EDGE_VOICES.get((target_lang or "ru").lower(),
@@ -971,14 +1105,37 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
     extract_audio(str(video_path), str(audio_wav))
     video_duration_ms = get_video_duration(str(video_path))
 
-    # Stage 2
-    segments = transcribe_audio(str(audio_wav), whisper_model=whisper_model,
-                                language=source_lang)
-    with open(artifacts_dir / f"{ts}_{stem}_transcript.json", "w", encoding="utf-8") as f:
-        json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
+    # Stage 2 (resume: load saved transcript/translation if present)
+    def _load_segments(path):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        fields = Segment.__dataclass_fields__
+        return [Segment(**{k: v for k, v in d.items() if k in fields}) for d in data]
+
+    transcript_path = _find_artifact(artifacts_dir, stem, "_transcript.json")
+    translated_path = _find_artifact(artifacts_dir, stem, "_translated.json")
+
+    segments = None
+    skip_diarization = no_diarization
+    skip_translation = False
+    if translated_path:
+        segments = _load_segments(translated_path)
+        skip_diarization = True
+        skip_translation = True
+        log(f"RESUME: loaded {len(segments)} translated segments ({translated_path.name}) "
+            f"— skipping Whisper + diarization + translation")
+    elif transcript_path:
+        segments = _load_segments(transcript_path)
+        log(f"RESUME: loaded {len(segments)} segments ({transcript_path.name}) — skipping Whisper only")
+
+    if segments is None:
+        segments = transcribe_audio(str(audio_wav), whisper_model=whisper_model,
+                                    language=source_lang)
+        with open(artifacts_dir / f"{stem}_transcript.json", "w", encoding="utf-8") as f:
+            json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
 
     # Stage 2.5
-    if not no_diarization and segments:
+    if not skip_diarization and segments:
         log("Diarization (F0 + GMM)...")
         try:
             segments, diar = assign_speakers(segments, str(audio_wav),
@@ -994,16 +1151,19 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
                 s.gender = "female"
     else:
         for s in segments:
-            s.voice = v_female
+            if not s.voice:  # не затираем сохранённые голоса при resume
+                s.voice = v_female
 
     # Stage 3
-    segments = translate_segments(segments, hy_mt_model, source_lang, target_lang,
-                                  batch_size=batch_size)
-    with open(artifacts_dir / f"{ts}_{stem}_translated.json", "w", encoding="utf-8") as f:
-        json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
+    if not skip_translation and segments:
+        segments = translate_segments(segments, hy_mt_model, source_lang, target_lang,
+                                      batch_size=batch_size)
+        with open(artifacts_dir / f"{stem}_translated.json", "w", encoding="utf-8") as f:
+            json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
 
     # Stage 4
-    clone_mode = (voice_clone and engine_name == "qwen")
+    clone_mode = voice_clone and engine_name in ("qwen", "chatterbox")
+    refs = None
     if clone_mode:
         # voice-clone: key voices by speaker label (SPEAKER_01, ...) not by gender
         for s in segments:
@@ -1015,11 +1175,20 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
             clone_mode = False
             for s in segments:
                 s.voice = v_female
+    elif engine_name in ("qwen", "chatterbox"):
+        # Named-speaker mode on a cloning engine: without refs every segment would
+        # come out in the engine's single default voice — so clone per gender from
+        # the source audio (male lines -> male ref, female lines -> female ref).
+        log("Named-speaker mode: selecting per-gender reference clips...")
+        refs = select_voice_references(segments, str(audio_wav), artifacts_dir,
+                                       group_key=lambda s: s.voice) or None
+        if not refs:
+            log("No usable gender refs — engine will use its default voice", "WARN")
     edge_voice = v_female
     engine = create_tts_engine(engine_name, qwen_size=qwen_size,
                                qwen_model_path=qwen_model_path,
-                               voice_clone=clone_mode, edge_voice=edge_voice)
-    if clone_mode:
+                               voice_clone=clone_mode or bool(refs), edge_voice=edge_voice)
+    if refs:
         engine.set_references(refs)
     generate_all_tts(segments, artifacts_dir, engine, engine_name, target_lang,
                      tts_batch=tts_batch)
@@ -1049,7 +1218,7 @@ def main():
     p.add_argument("--target-lang", default="ru",
                    help="target language ISO code. Qwen3-TTS: zh,en,ja,ko,de,fr,ru,pt,es,it. "
                         "Edge-TTS fallback: uk,pl,tr,ar,hi,vi,nl,cs,sv,el,fi,da,he,th,id,ms,ro,hu,fa,bg")
-    p.add_argument("--tts-engine", default="auto", choices=["auto", "qwen", "edge", "pyttsx3"],
+    p.add_argument("--tts-engine", default="auto", choices=["auto", "qwen", "chatterbox", "edge", "pyttsx3"],
                    help="auto = Qwen if target supported, else Edge (default)")
     p.add_argument("--qwen-size", default="0.6b", choices=["0.6b", "1.7b"],
                    help="Qwen3-TTS model size (default 0.6b; 1.7b = better quality, slower)")
@@ -1063,8 +1232,7 @@ def main():
                    help="one voice for all segments (default female)")
     p.add_argument("--whisper-model", default="medium",
                    choices=["tiny", "base", "small", "medium", "large"])
-    p.add_argument("--hy-mt-model",
-                   default=r"G:\work\hermes\vvp-translate\.models\HY-MT1.5-1.8B-Q4_K_M.gguf",
+    p.add_argument("--hy-mt-model", default=DEFAULT_HY_MT_MODEL,
                    help="path to Hy-MT GGUF")
     p.add_argument("--batch-size", type=int, default=3,
                    help="segments per translation prompt (default 3; 1 = one by one, slow but safest)")

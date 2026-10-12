@@ -27,34 +27,42 @@ Video → Audio (ffmpeg)
 ## Установка
 
 ```bat
-cd G:\universal_dub
-uv venv --python 3.13 .venv
-uv pip install --python .venv\Scripts\python.exe -r requirements.txt
-uv pip install --python .venv\Scripts\python.exe --force-reinstall --no-deps torch --index-url https://download.pytorch.org/whl/cu126
+cd C:\work\universal_dub
+python -m venv venv
+venv\Scripts\python.exe -m pip install -r requirements.txt
+venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
-Модель Qwen3-TTS (скачается в `models/`, ~1.3 GB):
+Важно:
+- Рабочее окружение — `venv/` (Python 3.11). Старый `.venv/` (Python 3.13) сломан
+  (python.exe указывает на несуществующий интерпретатор) — не использовать.
+- `pip install whisper` ставит НЕ openai-whisper, а чужой пакет graphite
+  (однофайловый `whisper.py` без `load_model`). Если транскрипция падает —
+  `venv\Scripts\pip uninstall -y whisper` и `pip install openai-whisper`.
+- `llama-cpp-python` соберите с CUDA для быстрого перевода (см. `build_llama_cuda.bat`).
+
+Модель Qwen3-TTS (скачивается в `models/`, ~1.3 GB):
 ```bat
-.venv\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', local_dir='G:/universal_dub/models/Qwen3-TTS-0.6B-CustomVoice')"
+venv\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', local_dir='models/Qwen3-TTS-0.6B-CustomVoice')"
 ```
 
 ## Запуск
 
 ```bat
 :: английский → немецкий (Qwen 0.6B — быстро)
-.venv\Scripts\python.exe universal_dub.py video.mp4 --source-lang en --target-lang de
+venv\Scripts\python.exe universal_dub.py video.mp4 --source-lang en --target-lang de
 
 :: английский → немецкий, качество выше (Qwen 1.7B, ~x2 медленнее)
-.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang de --qwen-size 1.7b
+venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang de --qwen-size 1.7b
 
 :: VOICE CLONE — клонировать голоса актёров оригинала (лучший вариант!)
-.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang de --voice-clone --qwen-size 1.7b
+venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang de --voice-clone --qwen-size 1.7b
 
 :: английский → русский
-.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang ru
+venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang ru
 
 :: украинский (Edge-TTS fallback, Qwen не говорит по-украински)
-.venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang uk
+venv\Scripts\python.exe universal_dub.py video.mp4 --target-lang uk
 ```
 
 ## Voice Clone (Qwen3-TTS Base)
@@ -162,14 +170,14 @@ universal_dub/
 В этом окружении уже собрана с CUDA 13.3. Для повторной сборки:
 
 ```bat
-G:\universal_dub\build_llama_cuda.bat
+C:\work\universal_dub\build_llama_cuda.bat
 ```
 
 Требования: MSVC 2022 (VS Community), CUDA Toolkit, cmake 3.31 (4.x ломает
 определение CUDA-компилятора на Windows). Проверка:
 
 ```bat
-.venv\Scripts\python.exe -c "import llama_cpp; print(llama_cpp.llama_supports_gpu_offload())"
+venv\Scripts\python.exe -c "import llama_cpp; print(llama_cpp.llama_supports_gpu_offload())"
 :: True = GPU offload работает
 ```
 
@@ -181,5 +189,6 @@ G:\universal_dub\build_llama_cuda.bat
 - [x] Batch-перевод — 3 сегмента одним промптом, авто-fallback
 - [x] Batch-TTS + предвычисленный voice-clone prompt + resume (повторный прогон не переозвучивает готовое)
 - [ ] A/B выбор голоса (auto-select по native language)
-- [ ] Web UI (Gradio/Streamlit)
-- [ ] Прогресс-бар (rich)
+- [x] Web UI (Gradio) — `webui.py`, live-лог + прогресс + resume
+- [x] Прогресс-бар (в Web UI, per-stage)
+- [x] Chatterbox Multilingual V3 как 3-й TTS-движок (23 языка + клонирование)

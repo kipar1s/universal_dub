@@ -2,16 +2,23 @@
 __pycache__/
 *.py[cod]
 .venv/
+venv/
+.idea/
+.pytest_cache/
 
 # Models (~GB)
 models/
 
 # Outputs
 output/
+webui_output/
+test_final/
 test_out*/
 e2e_clip.mp4
 test_*.wav
 *.log
+run_*.start
+run_*.end
 
 # OS
 Thumbs.db
