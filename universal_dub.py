@@ -534,11 +534,18 @@ def transcribe_audio(audio_path, whisper_model="medium", language=None, device_h
     Returns a list of Segment (via group_words_into_segments).
     """
     import torch
-    import whisper
     # Защита от конфликта пакетов: в site-packages может лежать чужой
     # однофайловый модуль whisper (graphite 'whisper.py'), который НЕ имеет
-    # load_model. Без проверки он молча вернул бы не-сегменты и сломал бы
-    # весь пайплайн (см. баг: return model, processor).
+    # load_model и падает уже на import (ctypes.CDLL(None) → TypeError).
+    # Без try/except пользователь видит непонятный TypeError вместо фикса.
+    try:
+        import whisper
+    except Exception as e:
+        raise RuntimeError(
+            f"import whisper failed ({type(e).__name__}: {e}). "
+            "Скорее всего установлен чужой пакет 'whisper' (graphite), а нужен openai-whisper. "
+            "Фикс:  pip uninstall -y whisper && pip install openai-whisper"
+        ) from e
     if not hasattr(whisper, "load_model"):
         raise RuntimeError(
             "Imported 'whisper' is not openai-whisper (has no load_model). "
@@ -872,10 +879,20 @@ def select_voice_references(segments, audio_wav, artifacts_dir, group_key=None):
 def create_tts_engine(engine_name, qwen_size="0.6b", qwen_model_path=None,
                       voice_clone=False, edge_voice="en-US-AriaNeural"):
     if engine_name == "qwen":
-        kind = "base" if voice_clone else "custom"
-        return QwenTTS(size=qwen_size, kind=kind, model_path=qwen_model_path)
+        try:
+            kind = "base" if voice_clone else "custom"
+            return QwenTTS(size=qwen_size, kind=kind, model_path=qwen_model_path)
+        except ImportError as e:
+            log(f"Qwen3-TTS unavailable ({e}) — falling back to Edge-TTS. "
+                "Fix: pip install qwen-tts", "WARN")
+            return EdgeTTS(voice=edge_voice)
     if engine_name == "chatterbox":
-        return ChatterboxTTS()
+        try:
+            return ChatterboxTTS()
+        except ImportError as e:
+            log(f"Chatterbox unavailable ({e}) — falling back to Edge-TTS. "
+                "Fix: pip install chatterbox-tts", "WARN")
+            return EdgeTTS(voice=edge_voice)
     if engine_name == "edge":
         return EdgeTTS(voice=edge_voice)
     if engine_name == "pyttsx3":
