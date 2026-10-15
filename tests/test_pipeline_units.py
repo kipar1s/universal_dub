@@ -59,7 +59,7 @@ def test_voices_for_qwen_lang():
 def test_voices_for_edge_fallback_lang():
     m, f, engine = ud.voices_for("uk")
     assert engine == "edge"
-    assert m == "uk-UA-PavloNeural" and f == "uk-UA-PolinaNeural"
+    assert m == "uk-UA-OstapNeural" and f == "uk-UA-PolinaNeural"
 
 
 def test_voices_for_unknown_lang_falls_back_to_english():

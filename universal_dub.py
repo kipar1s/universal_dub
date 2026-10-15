@@ -119,30 +119,30 @@ EDGE_VOICES = {
     "de": ("de-DE-ConradNeural", "de-DE-KatjaNeural"),
     "fr": ("fr-FR-HenriNeural", "fr-FR-DeniseNeural"),
     "es": ("es-ES-AlvaroNeural", "es-ES-ElviraNeural"),
-    "pt": ("pt-BR-AntonioNeural", "pt-BR-ThelmaNeural"),
+    "pt": ("pt-BR-AntonioNeural", "pt-BR-FranciscaNeural"),
     "it": ("it-IT-DiegoNeural", "it-IT-ElsaNeural"),
     "ja": ("ja-JP-KeitaNeural", "ja-JP-NanamiNeural"),
     "ko": ("ko-KR-InJoonNeural", "ko-KR-SunHiNeural"),
     "zh": ("zh-CN-YunxiNeural", "zh-CN-XiaoxiaoNeural"),
-    "uk": ("uk-UA-PavloNeural", "uk-UA-PolinaNeural"),
+    "uk": ("uk-UA-OstapNeural", "uk-UA-PolinaNeural"),
     "pl": ("pl-PL-MarekNeural", "pl-PL-ZofiaNeural"),
     "tr": ("tr-TR-AhmetNeural", "tr-TR-EmelNeural"),
     "ar": ("ar-SA-HamedNeural", "ar-SA-ZariyahNeural"),
     "hi": ("hi-IN-MadhurNeural", "hi-IN-SwaraNeural"),
     "vi": ("vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"),
-    "nl": ("nl-NL-MaartenNeural", "nl-NL-XeniaNeural"),
+    "nl": ("nl-NL-MaartenNeural", "nl-NL-FennaNeural"),
     "cs": ("cs-CZ-AntoninNeural", "cs-CZ-VlastaNeural"),
-    "sv": ("sv-SE-MattiasNeural", "sv-SE-SveaNeural"),
-    "el": ("el-GR-NestorasNeural", "el-GR-AlexiaNeural"),
+    "sv": ("sv-SE-MattiasNeural", "sv-SE-SofieNeural"),
+    "el": ("el-GR-NestorasNeural", "el-GR-AthinaNeural"),
     "fi": ("fi-FI-HarriNeural", "fi-FI-NooraNeural"),
     "da": ("da-DK-JeppeNeural", "da-DK-ChristelNeural"),
     "he": ("he-IL-AvriNeural", "he-IL-HilaNeural"),
-    "th": ("th-TH-PremwadeeNeural", "th-TH-PremwadeeNeural"),
+    "th": ("th-TH-NiwatNeural", "th-TH-PremwadeeNeural"),
     "id": ("id-ID-ArdiNeural", "id-ID-GadisNeural"),
     "ms": ("ms-MY-OsmanNeural", "ms-MY-YasminNeural"),
-    "ro": ("ro-RO-VladuNeural", "ro-RO-AlinaNeural"),
-    "hu": ("hu-HU-TamasNeural", "hu-HU-TamásNeural"),
-    "fa": ("fa-IR-FaridehNeural", "fa-IR-FaridehNeural"),
+    "ro": ("ro-RO-EmilNeural", "ro-RO-AlinaNeural"),
+    "hu": ("hu-HU-TamasNeural", "hu-HU-NoemiNeural"),
+    "fa": ("fa-IR-FaridNeural", "fa-IR-DilaraNeural"),
     "bg": ("bg-BG-BorislavNeural", "bg-BG-KalinaNeural"),
 }
 
@@ -395,8 +395,21 @@ class EdgeTTS:
         async def _run():
             comm = edge_tts.Communicate(text, voice or self.voice,
                                         rate=self.rate, volume=self.volume)
-            await comm.save(str(output_path))
-        asyncio.run(_run())
+            await comm.save(str(tmp_mp3))
+        # edge_tts всегда пишет MP3 независимо от расширения. Пайплайн читает
+        # wav через модуль wave (_tts_duration_bad, merge) — конвертируем сразу,
+        # иначе валидация длительности и сшивка для Edge молча деградируют.
+        tmp_mp3 = str(Path(str(output_path) + ".mp3.tmp"))
+        try:
+            asyncio.run(_run())
+            r = subprocess.run([_FFMPEG_EXE, "-y", "-i", tmp_mp3,
+                                "-ar", "24000", "-ac", "1",
+                                "-c:a", "pcm_s16le", str(output_path)],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"edge mp3->wav conversion failed: {r.stderr[-200:]}")
+        finally:
+            Path(tmp_mp3).unlink(missing_ok=True)
 
 
 class Sapi5TTS:
@@ -681,8 +694,6 @@ def translate_segments(segments, hy_mt_model_path, src_lang, tgt_lang,
             return any('\u4E00' <= c <= '\u9FFF' for c in text)
         if tl == "ko":
             return any('\uAC00' <= c <= '\uD7A3' for c in text)
-        if tl == "ja":
-            return any('\u3040' <= c <= '\u30FF' for c in text)
         if tl == "ar":
             return any('\u0600' <= c <= '\u06FF' for c in text)
         if tl == "he":
@@ -909,8 +920,6 @@ def generate_all_tts(segments, output_dir, engine, engine_name, target_lang,
     skipped = len(to_gen) - len(pending)
     if skipped:
         log(f"TTS resume: {skipped}/{len(to_gen)} already done, generating {len(pending)}")
-    ok = fail = 0
-    t0 = time.time()
 
     batch_fn = getattr(engine, "generate_batch_sync", None)
     if batch_fn and pending and tts_batch > 1:

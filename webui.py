@@ -91,6 +91,12 @@ def run_job(video_file, local_path, target_lang, source_lang, engine,
 
     logs: list[str] = []
     result_video = None
+    # drain stale items left by a previous job (client disconnect mid-run)
+    while not _q.empty():
+        try:
+            _q.get_nowait()
+        except queue.Empty:
+            break
     rd = (resume_dir or "").strip()
     if rd:
         out_dir = Path(rd).expanduser().resolve()
