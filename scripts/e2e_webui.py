@@ -33,9 +33,7 @@ job = c.submit(
 print("submitted OK")
 
 result = job.result(timeout=1200)
-log_text, video_out = result[0], result[1]
-print("\n===== LAST 30 LOG LINES =====")
-print("\n".join(log_text.splitlines()[-30:]))
-print("\n===== VIDEO OUTPUT =====")
+log_html, stages_html, video_out = result[0], result[1], result[2]
+print("\n===== RESULT =====")
 print(video_out)
 sys.exit(0 if video_out else 1)

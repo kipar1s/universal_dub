@@ -31,8 +31,8 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-# ─── ffmpeg ──────────────────────────────────────────────────────
-_FFMPEG_EXE = r"C:\ffmpeg\bin\ffmpeg.exe"
+# ─── ffmpeg (override: UD_FFMPEG env) ────────────────────────────
+_FFMPEG_EXE = os.environ.get("UD_FFMPEG") or r"C:\ffmpeg\bin\ffmpeg.exe"
 if not os.path.isfile(_FFMPEG_EXE):          # портативный fallback: ffmpeg из PATH
     _FFMPEG_EXE = shutil.which("ffmpeg") or "ffmpeg"
 os.environ["FFMPEG"] = _FFMPEG_EXE
@@ -40,13 +40,17 @@ _ffmpeg_dir = os.path.dirname(_FFMPEG_EXE)
 if os.path.isfile(_FFMPEG_EXE) and _ffmpeg_dir not in os.environ.get("PATH", ""):
     os.environ["PATH"] = _ffmpeg_dir + ";" + os.environ.get("PATH", "")
 
-# ─── SoX (нужен qwen_tts 25Hz VQ tokenizer; без него — warning при импорте) ──
-_SOX_DIR = r"C:\tools\sox"
+# ─── SoX (нужен qwen_tts 25Hz VQ tokenizer; без него — warning при импорте;
+#     override: UD_SOX_DIR env) ─────────────────────────────────────
+_SOX_DIR = os.environ.get("UD_SOX_DIR") or r"C:\tools\sox"
 if os.path.isdir(_SOX_DIR) and _SOX_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = _SOX_DIR + ";" + os.environ.get("PATH", "")
 
-# ─── Hy-MT default model (translation stage) ─────────────────────
-DEFAULT_HY_MT_MODEL = r"G:\work\hermes\vvp-translate\.models\HY-MT1.5-1.8B-Q4_K_M.gguf"
+# ─── Hy-MT default model (translation stage; override: UD_HY_MT_MODEL env
+#     or --hy-mt-model) ────────────────────────────────────────────
+DEFAULT_HY_MT_MODEL = os.environ.get(
+    "UD_HY_MT_MODEL",
+    r"G:\work\hermes\vvp-translate\.models\HY-MT1.5-1.8B-Q4_K_M.gguf")
 
 
 def log(msg, level="INFO"):
@@ -886,7 +890,9 @@ def _tts_name(seg):
 def _tts_duration_bad(pth, seg):
     """Защита от «разбегавшейся» генерации (batch-режим qwen_tts иногда
     не останавливается на EOS и выдаёт десятки минут тишости/повторов).
-    Короткая фраза не может звучать втрое дольше оригинала и дольше 15 с.
+    Флаг ставится если: аудио длиннее минуты (любой сегмент Whisper короче),
+    ИЛИ длиннее оригинала втрое при абсолютном превышении 5 с
+    (легитимный TTS-перевод редко длиннее исходника в 2 раза).
     """
     try:
         with wave.open(str(pth), "rb") as wf:
@@ -894,7 +900,7 @@ def _tts_duration_bad(pth, seg):
     except Exception:
         return False
     src = max((seg.end_ms - seg.start_ms) / 1000.0, 1.0)
-    return dur > 15.0 and dur > 3.0 * src
+    return dur > 60.0 or (dur > 3.0 * src and dur > 5.0)
 
 
 def generate_all_tts(segments, output_dir, engine, engine_name, target_lang,
@@ -1005,12 +1011,22 @@ def merge_tts_segments(segments, video_duration_ms, output_wav):
             cmd = [ffmpeg, "-y", "-i", seg.tts_file, "-af", ",".join(filters),
                    "-ar", str(sr), str(stretched_path)]
             try:
-                subprocess.run(cmd, capture_output=True, timeout=120, text=True)
-            except subprocess.TimeoutExpired:
-                shutil.copy(seg.tts_file, stretched_path)
+                r = subprocess.run(cmd, capture_output=True, timeout=120, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(r.stderr[-200:])
+            except (subprocess.TimeoutExpired, RuntimeError):
+                # atempo не применился — конвертируем без фильтра (сохраняя sr);
+                # слепая копия дала бы неверную скорость при sr != sr(TTS)
+                r2 = subprocess.run([ffmpeg, "-y", "-i", seg.tts_file,
+                                     "-ar", str(sr), str(stretched_path)],
+                                    capture_output=True, text=True)
+                if r2.returncode != 0:
+                    shutil.copy(seg.tts_file, stretched_path)
         else:
             cmd = [ffmpeg, "-y", "-i", seg.tts_file, "-ar", str(sr), str(stretched_path)]
-            subprocess.run(cmd, capture_output=True, text=True)
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                shutil.copy(seg.tts_file, stretched_path)
         stretched.append((seg, str(stretched_path)))
     log(f"Stretched {len(stretched)} segments")
 
@@ -1039,7 +1055,7 @@ def merge_tts_segments(segments, video_duration_ms, output_wav):
 # ─── Stage 6: Video + audio ──────────────────────────────────────
 
 def merge_video_audio(video_path, dubbed_wav, output_mp4,
-                      remove_original=True, original_vol="0%"):
+                      remove_original=True, original_vol="35%"):
     if remove_original:
         cmd = [_FFMPEG_EXE, "-y", "-i", str(video_path), "-i", str(dubbed_wav),
                "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
@@ -1111,8 +1127,10 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
 
     # Stage 1
     audio_wav = artifacts_dir / f"{ts}_{stem}_audio.wav"
+    report_progress("extract", 0, 1)
     extract_audio(str(video_path), str(audio_wav))
     video_duration_ms = get_video_duration(str(video_path))
+    report_progress("extract", 1, 1)
 
     # Stage 2 (resume: load saved transcript/translation if present)
     def _load_segments(path):
@@ -1138,14 +1156,17 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
         log(f"RESUME: loaded {len(segments)} segments ({transcript_path.name}) — skipping Whisper only")
 
     if segments is None:
+        report_progress("transcribe", 0, 1)
         segments = transcribe_audio(str(audio_wav), whisper_model=whisper_model,
                                     language=source_lang)
+        report_progress("transcribe", 1, 1)
         with open(artifacts_dir / f"{stem}_transcript.json", "w", encoding="utf-8") as f:
             json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
 
     # Stage 2.5
     if not skip_diarization and segments:
         log("Diarization (F0 + GMM)...")
+        report_progress("diarize", 0, 1)
         try:
             segments, diar = assign_speakers(segments, str(audio_wav),
                                              v_male, v_female)
@@ -1158,6 +1179,7 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
             for s in segments:
                 s.voice = v_female
                 s.gender = "female"
+        report_progress("diarize", 1, 1)
     else:
         for s in segments:
             if not s.voice:  # не затираем сохранённые голоса при resume
@@ -1208,7 +1230,9 @@ def run_pipeline(video_path, source_lang, target_lang, output_dir,
 
     # Stage 6
     out_mp4 = output_dir / f"{stem}_{(target_lang or 'xx').lower()}_dubbed.mp4"
+    report_progress("mux", 0, 1)
     merge_video_audio(str(video_path), str(dubbed_wav), str(out_mp4), remove_original)
+    report_progress("mux", 1, 1)
 
     log("=" * 70)
     log(f"✓ COMPLETE: {out_mp4}")
