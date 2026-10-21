@@ -1,22 +1,35 @@
 # universal_dub — Universal Video Dubbing (any Whisper language -> any supported TTS language)
+#
+# ВАЖНО: пакет называется openai-whisper. Если поставить просто `whisper`,
+# pip поставит чужой однофайловый graphite-модуль (без load_model) и
+# транскрипция сломается.
+#
+# Torch ставится ОТДЕЛЬНО (CUDA-сборка), см. README:
+#   venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126
+#
+# llama-cpp-python — соберите с CUDA для быстрого перевода:
+#   build_llama_cuda.bat (или CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python)
 
 ## Core
-pyyaml>=6.0
 numpy>=1.26
 soundfile>=0.12
 librosa>=0.10
 scikit-learn>=1.4
-openai-whisper>=20240930
-omegaconf>=2.3.0
-edge-tts>=6.1.9          # fallback engine (75 languages, cloud)
-pyttsx3>=2.99            # last-resort fallback (Windows SAPI5)
+scipy>=1.10
+openai-whisper>=20240930   # STT (word-level timestamps)
 
-## TTS: Qwen3-TTS (local, GPU) — primary engine, 10 languages
-# NOTE: torch must be the CUDA build. If pip index serves CPU wheels, run:
-#   uv pip install --python <venv> --force-reinstall --no-deps torch --index-url https://download.pytorch.org/whl/cu126
-qwen-tts>=0.1.0
+## TTS
+qwen-tts>=0.1.0            # Qwen3-TTS local GPU (10 langs) — primary
+edge-tts>=6.1.9            # fallback engine (75 langs, cloud)
+# chatterbox-tts>=0.1.7    # опционально: Chatterbox V3 (23 langs + cloning)
+# pyttsx3>=2.99            # опционально: last-resort SAPI5 (Windows)
 
-## LLM translation (Hy-MT 1.5/1.8B GGUF via llama-cpp-python)
-# NOTE: build with CUDA for GPU inference:
-#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python
+## LLM translation (Hy-MT 1.5/1.8B GGUF)
 llama-cpp-python>=0.3.0
+
+## Web UI
+gradio>=5.0
+huggingface_hub>=0.24      # скачивание моделей Qwen3-TTS
+
+## Dev / tests
+pytest>=8.0
